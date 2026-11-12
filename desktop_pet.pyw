@@ -479,7 +479,8 @@ class Pet:
     def on_drop(self, e):
         self.held = False
         top = self.feet - self.h
-        hit = self.ceiling_near(top - GRAB_REACH, top)    # let go just below a top edge: hold on to it
+        # let go just below a top edge, or with his head above it (dragged to the very top): hold on
+        hit = self.ceiling_near(top - GRAB_REACH, top + GRAB_REACH)
         if hit:
             self.grab(*hit)
             return
