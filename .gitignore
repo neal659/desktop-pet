@@ -1,0 +1,15 @@
+# Python caches and build output
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+
+# Local settings and secrets
+*_settings.json
+.env
+.claude/
+
+# Agent notes (kept local)
+CLAUDE.md
+NOTES_FOR_NEXT_AGENT.md
