@@ -4,7 +4,8 @@ It walks along the bottom of every screen (on top of the taskbar), leaps onto th
 top edges of other windows, hangs from the top edge of maximised windows, rides
 along when you move a window, and falls off when the window goes away.
 Drag it with the left mouse button and let go to drop (or throw) it.
-Right-click the creature to close it.
+Right-click the creature: it goes away and comes back after 15 seconds.
+Middle-click the creature to close the program for good.
 Uses only the Python standard library (tkinter + ctypes).
 """
 import ctypes
@@ -15,7 +16,8 @@ import random
 import tkinter as tk
 
 # --- Look (same sprite as the usage-window creature) ---------------------
-PX = 4                              # on-screen size of one sprite pixel
+PX = 4                              # size of one sprite pixel on the main screen (other screens: scaled
+                                    # so the creature is the same physical size, see monitors())
 GRID_W, GRID_H = 15, 10             # sprite size in sprite pixels (60 x 40 on screen)
 BODY_COLOR = "#FF7A1A"
 EYE_COLOR = "#1C1E25"
@@ -49,6 +51,7 @@ LEAP_APEX = 70                      # the leap arc goes this many pixels above t
 HANG_TICKS = (150, 600)             # how long it hangs before letting go (about 4 to 18 s)
 GRAB_REACH = 25                     # dropped this close below a top edge: it grabs it
 EDGE_TURN_CHANCE = 0.7              # at the end of a window top: turn around (otherwise walk off)
+RESPAWN_MS = 15000                  # right-click: gone for this long, then it drops in from the top again
 MIN_LEDGE = 30                      # ignore visible bits of window tops narrower than this
 
 # --- Windows API -----------------------------------------------------------
@@ -59,8 +62,16 @@ MONITOR_PROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HMONITOR, wt.HDC, ctypes.POINTER(w
 
 
 class MONITORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT), ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT), ("rcWork", wt.RECT), ("dwFlags", wt.DWORD),
+                ("szDevice", ctypes.c_wchar * 32)]     # (this is MONITORINFOEXW)
 
+
+gdi32 = ctypes.windll.gdi32
+gdi32.CreateDCW.restype = wt.HDC
+gdi32.CreateDCW.argtypes = [wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, ctypes.c_void_p]
+gdi32.GetDeviceCaps.argtypes = [wt.HDC, ctypes.c_int]
+gdi32.DeleteDC.argtypes = [wt.HDC]
+HORZSIZE = 4                        # GetDeviceCaps: width of the screen in millimetres
 
 user32.EnumWindows.argtypes = [ENUM_PROC, wt.LPARAM]
 user32.EnumDisplayMonitors.argtypes = [wt.HDC, ctypes.POINTER(wt.RECT), MONITOR_PROC, wt.LPARAM]
@@ -98,6 +109,7 @@ def monitors():
     """Every screen as a dict: 'screen' and 'work' are (left, top, right, bottom).
 
     'work' is the screen without its taskbar, so work[3] is where the creature stands.
+    'ppmm' is pixels per millimetre (0 if Windows does not know the physical size).
     The main screen comes first.
     """
     found = []
@@ -107,13 +119,23 @@ def monitors():
         info.cbSize = ctypes.sizeof(MONITORINFO)
         user32.GetMonitorInfoW(hmon, ctypes.byref(info))
         s, w = info.rcMonitor, info.rcWork
+        ppmm = 0.0
+        dc = gdi32.CreateDCW(info.szDevice, None, None, None)
+        if dc:
+            mm = gdi32.GetDeviceCaps(dc, HORZSIZE)
+            gdi32.DeleteDC(dc)
+            ppmm = (s.right - s.left) / mm if mm > 0 else 0.0
         found.append({"screen": (s.left, s.top, s.right, s.bottom),
                       "work": (w.left, w.top, w.right, w.bottom),
-                      "primary": bool(info.dwFlags & MONITORINFOF_PRIMARY)})
+                      "primary": bool(info.dwFlags & MONITORINFOF_PRIMARY),
+                      "ppmm": ppmm})
         return True
 
     user32.EnumDisplayMonitors(None, None, MONITOR_PROC(visit), 0)
     found.sort(key=lambda m: not m["primary"])
+    main = found[0]["ppmm"] if found else 0.0
+    for m in found:                                       # sprite pixel size that keeps the physical size
+        m["px"] = max(1, round(PX * m["ppmm"] / main)) if main and m["ppmm"] else PX
     return found
 
 
@@ -235,15 +257,19 @@ def find_at(spots, key, x):
 class Pet:
     def __init__(self, root):
         self.root = root
-        self.w, self.h = GRID_W * PX, GRID_H * PX
+        self.px = PX
+        self.w, self.h = GRID_W * self.px, GRID_H * self.px
         root.overrideredirect(True)                 # no title bar, no taskbar button
         root.attributes("-topmost", True)           # stay above other windows
         root.attributes("-transparentcolor", SEE_THROUGH)
         root.config(bg=SEE_THROUGH)
+        self.gone = False                           # hidden, waiting to respawn
+        self.redraw = False                         # draw at once (after the size changed)
         self.canvas = tk.Canvas(root, width=self.w, height=self.h, bg=SEE_THROUGH,
                                 highlightthickness=0, bd=0)
         self.canvas.pack()
-        self.canvas.bind("<Button-3>", lambda e: root.destroy())   # right-click closes
+        self.canvas.bind("<Button-3>", self.vanish)                # right-click: gone for a while
+        self.canvas.bind("<Button-2>", lambda e: root.destroy())   # middle-click: quit for good
         self.canvas.bind("<ButtonPress-1>", self.on_grab)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_drop)
@@ -279,6 +305,25 @@ class Pet:
             if l <= x < r and t <= y < b:
                 return m
         return None
+
+    def fits(self, x, feet):
+        """True if the sprite's side at x, standing with its feet at `feet`, is over a screen (not empty space)."""
+        return (self.screen_at(x, feet - 1) is not None
+                and self.screen_at(x, feet - self.h + 1) is not None)
+
+    def update_scale(self):
+        """Keep the creature the same physical size on every screen (screens differ in pixels per mm)."""
+        m = self.screen_at(self.centre(), self.feet - self.h / 2)
+        if m is None or m["px"] == self.px:
+            return
+        cx, old_h = self.centre(), self.h
+        self.px = m["px"]
+        self.w, self.h = GRID_W * self.px, GRID_H * self.px
+        self.canvas.config(width=self.w, height=self.h)
+        self.x = cx - self.w / 2
+        if self.hanging:
+            self.feet += self.h - old_h                   # keep the hands at the edge
+        self.redraw = True
 
     def lowest_floor_at(self, x):
         """The bottom of the screen(s) below x, or of the closest screen if x is between screens."""
@@ -397,10 +442,21 @@ class Pet:
             return False
         y, (seg_l, seg_r) = spot
         self.feet = float(y)                              # follows the window or taskbar up and down
+        if not self.fits(self.x, self.feet):              # half of it hangs over empty space: slide back on
+            self.x += 2
+            self.facing = 1
+            return True
+        if not self.fits(self.x + self.w - 1, self.feet):
+            self.x -= 2
+            self.facing = -1
+            return True
         if self.walk_left > 0:
             self.walk_left -= 1
             step = WALK_SPEED * self.facing
             new_cx = self.centre() + step
+            if not self.fits(new_cx + self.facing * (self.w / 2 - 1), self.feet):
+                self.facing = -self.facing                # the body would go over the edge of the screens: turn
+                return True
             if not seg_l <= new_cx <= seg_r:              # reached the end
                 beyond = self.screen_at(new_cx, self.feet - 1)
                 on_floor = isinstance(self.on_key, tuple)
@@ -431,6 +487,8 @@ class Pet:
             return False
         y, (seg_l, seg_r) = spot
         self.feet = float(y + self.h)
+        if self.walk_left > 0 and not self.fits(self.centre() + self.facing * (CLIMB_SPEED + self.w / 2 - 1), self.feet):
+            self.facing = -self.facing                    # the body would go over the edge of the screens
         self.hang_left -= 1
         if self.hang_left <= 0:
             self.start_falling()                          # let go
@@ -460,6 +518,29 @@ class Pet:
                     self.x += left - self.on_left
                 self.on_left = left
                 return
+
+    # --- Vanishing and respawning ---------------------------------------------
+    def vanish(self, _event=None):
+        self.gone = True
+        self.held = False
+        self.root.withdraw()
+        self.root.after(RESPAWN_MS, self.respawn)
+
+    def respawn(self):
+        """Drop in from the top of the main screen at a random spot."""
+        left, top, right, _ = self.mons[0]["work"]
+        self.px = PX
+        self.w, self.h = GRID_W * self.px, GRID_H * self.px
+        self.canvas.config(width=self.w, height=self.h)
+        self.x = float(random.randint(left, right - self.w))
+        self.feet = float(top + self.h)
+        self.start_falling()
+        self.facing = random.choice((-1, 1))
+        self.rest_left = 30
+        self.redraw = True
+        self.gone = False
+        self.root.deiconify()
+        self.root.attributes("-topmost", True)
 
     # --- Mouse ------------------------------------------------------------
     def on_grab(self, e):
@@ -531,13 +612,17 @@ class Pet:
         for y, row in enumerate(rows):
             for x, ch in enumerate(row):
                 if ch in colors:
-                    c.create_rectangle(x * PX, y * PX, (x + 1) * PX, (y + 1) * PX,
+                    c.create_rectangle(x * self.px, y * self.px, (x + 1) * self.px, (y + 1) * self.px,
                                        fill=colors[ch], outline="")
 
     # --- Main loop ----------------------------------------------------------
     def tick(self):
+        if self.gone:                                     # hidden: just wait
+            self.root.after(TICK_MS, self.tick)
+            return
         self.mons = monitors()                            # screens and taskbars can change
         self.wins = windows_front_to_back()
+        self.update_scale()
         self.ledges, self.ceilings = find_spots(self.wins, self.mons, self.h)
         moving = False
         if not self.held:
@@ -546,7 +631,8 @@ class Pet:
             else:
                 self.ride()
                 moving = self.hang() if self.hanging else self.walk()
-        if self.ticks % TICKS_PER_FRAME == 0:
+        if self.ticks % TICKS_PER_FRAME == 0 or self.redraw:
+            self.redraw = False
             self.frame += 1
             self.draw(self.sprite_rows(moving))
         self.root.geometry(f"{self.w}x{self.h}+{round(self.x)}+{round(self.feet) - self.h}")
