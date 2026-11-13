@@ -5,7 +5,7 @@ top edges of other windows, hangs from the top edge of maximised windows, rides
 along when you move a window, and falls off when the window goes away.
 Drag it with the left mouse button and let go to drop (or throw) it.
 Right-click the creature: it goes away and comes back after 15 seconds.
-Ctrl + right-click (or middle-click) the creature to close the program for good.
+Shift + right-click: choose his colour. Ctrl + right-click (or middle-click): close the program for good.
 Uses only the Python standard library (tkinter + ctypes).
 """
 import ctypes
@@ -21,6 +21,22 @@ PX = 4                              # size of one sprite pixel on the main scree
 GRID_W, GRID_H = 15, 10             # sprite size in sprite pixels (60 x 40 on screen)
 BODY_COLOR = "#FF7A1A"
 EYE_COLOR = "#1C1E25"
+# Colours to choose from (Shift + right-click): name, body colour, eye colour. The first is the original.
+# Every start picks one at random.
+PALETTE = [
+    ("Orange", "#FF7A1A", "#1C1E25"),
+    ("Blue", "#3B8BFF", "#12182B"),
+    ("Sky", "#6FD3FF", "#12202B"),
+    ("Teal", "#19C3B1", "#0F2623"),
+    ("Green", "#3DDC84", "#10261A"),
+    ("Lime", "#B6E83A", "#202A0C"),
+    ("Yellow", "#FFD23F", "#2B2410"),
+    ("Pink", "#FF6FB5", "#2B1220"),
+    ("Red", "#F0454A", "#2B1011"),
+    ("Purple", "#9B59FF", "#1A1030"),
+    ("White", "#F2F2F2", "#1C1E25"),
+    ("Black", "#26262E", "#F2F2F2"),
+]
 SEE_THROUGH = "#FF00FE"             # this colour is drawn as "nothing" (see-through)
 
 BODY_ROW = "..OOOOOOOOOOO.."
@@ -102,6 +118,25 @@ DWMWA_EXTENDED_FRAME_BOUNDS = 9     # the window's real visible edges (without t
 DWMWA_CLOAKED = 14                  # "cloaked" = hidden by Windows (other virtual desktop, background apps)
 SKIP_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}  # desktop and taskbar
 OWN_PID = os.getpid()
+
+
+def blend(colour, other, amount):
+    """Mix two '#rrggbb' colours: amount 0 gives colour, 1 gives other."""
+    a = [int(colour[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(other[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * amount) for x, y in zip(a, b))
+
+
+def is_light(colour):
+    r, g, b = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
+    return 0.299 * r + 0.587 * g + 0.114 * b > 150
+
+
+def rounded(canvas, x1, y1, x2, y2, r, **kw):
+    """A rectangle with rounded corners on a canvas (radius r). Returns the item id."""
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2,
+           x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return canvas.create_polygon(pts, smooth=True, **kw)
 
 
 def enable_real_pixels():
@@ -345,6 +380,8 @@ class Pet:
         root.attributes("-transparentcolor", SEE_THROUGH)
         root.config(bg=SEE_THROUGH)
         self.gone = False                           # hidden, waiting to respawn
+        self.menu = None                            # the colour menu while it is open
+        self.colour = random.choice(PALETTE)
         self.redraw = False                         # draw at once (after the size changed)
         self.canvas = tk.Canvas(root, width=self.w, height=self.h, bg=SEE_THROUGH,
                                 highlightthickness=0, bd=0)
@@ -817,10 +854,76 @@ class Pet:
         if event is not None and event.state & 0x0004:    # Ctrl held: quit for good
             self.root.destroy()
             return
+        if event is not None and event.state & 0x0001:    # Shift held: colour menu
+            self.open_menu(event)
+            return
         self.gone = True
         self.held = False
         self.root.withdraw()
         self.root.after(RESPAWN_MS, self.respawn)
+
+    # --- Colour menu ----------------------------------------------------------
+    def open_menu(self, event):
+        self.close_menu()
+        row_w, row_h, gap, pad = 104, 18, 2, 6
+        n = len(PALETTE)
+        w = row_w + 2 * pad
+        h = n * row_h + (n - 1) * gap + 2 * pad
+        menu = tk.Toplevel(self.root)
+        menu.overrideredirect(True)
+        menu.attributes("-topmost", True)
+        menu.attributes("-transparentcolor", SEE_THROUGH)     # the corners outside the rounded panel
+        menu.config(bg=SEE_THROUGH)
+        c = tk.Canvas(menu, width=w, height=h, bg=SEE_THROUGH, highlightthickness=0, bd=0)
+        c.pack()
+        rounded(c, 0, 0, w - 1, h - 1, 11, fill="#15171D", outline="#3A3D48")
+        for i, (name, body, eye) in enumerate(PALETTE):
+            y = pad + i * (row_h + gap)
+            tag = f"row{i}"
+            box = rounded(c, pad, y, pad + row_w, y + row_h, 6, fill=body, outline="", tags=(tag,))
+            mark = "✓  " if name == self.colour[0] else "     "
+            c.create_text(pad + 9, y + row_h / 2, text=mark + name, anchor="w", tags=(tag,),
+                          fill="#14161C" if is_light(body) else "#FFFFFF", font=("Segoe UI", 8, "bold"))
+            c.tag_bind(tag, "<Enter>", lambda e, b=box, col=body: c.itemconfig(b, fill=blend(col, "#FFFFFF", 0.18)))
+            c.tag_bind(tag, "<Leave>", lambda e, b=box, col=body: c.itemconfig(b, fill=col))
+            c.tag_bind(tag, "<Button-1>", lambda e, ch=(name, body, eye): self.choose_colour(ch))
+        c.config(cursor="arrow")
+        menu.bind("<Escape>", lambda e: self.close_menu())
+        menu.bind("<Button-1>", lambda e: self.close_menu() if not self.inside_menu(e) else None)
+        scr = self.screen_at(event.x_root, event.y_root) or self.mons[0]
+        sl, st, sr, sb = scr["screen"]
+        x = max(sl, min(event.x_root, sr - w))
+        y = max(st, min(event.y_root, sb - h))
+        menu.geometry(f"{w}x{h}+{x}+{y}")
+        self.menu = menu
+        menu.after(20, self.grab_menu)
+
+    def grab_menu(self):
+        if self.menu is not None:
+            try:
+                self.menu.focus_force()
+                self.menu.grab_set()                      # clicks outside the menu come to it, to close it
+            except tk.TclError:
+                pass
+
+    def inside_menu(self, e):
+        m = self.menu
+        return (m.winfo_rootx() <= e.x_root < m.winfo_rootx() + m.winfo_width()
+                and m.winfo_rooty() <= e.y_root < m.winfo_rooty() + m.winfo_height())
+
+    def close_menu(self):
+        if self.menu is not None:
+            try:
+                self.menu.grab_release()
+                self.menu.destroy()
+            except tk.TclError:
+                pass
+            self.menu = None
+
+    def choose_colour(self, colour):
+        self.colour = colour
+        self.redraw = True
+        self.close_menu()
 
     def respawn(self):
         """Drop in from the top of the main screen at a random spot."""
@@ -917,7 +1020,7 @@ class Pet:
     def draw(self, rows):
         c = self.canvas
         c.delete("all")
-        colors = {"O": BODY_COLOR, "E": EYE_COLOR}
+        colors = {"O": self.colour[1], "E": self.colour[2]}
         for y, row in enumerate(rows):
             for x, ch in enumerate(row):
                 if ch in colors:
@@ -935,7 +1038,7 @@ class Pet:
         self.ledges, self.ceilings = find_spots(self.wins, self.mons, self.h)
         self.walls = find_walls(self.wins, self.mons)
         moving = False
-        if not self.held:
+        if not self.held and self.menu is None:
             if self.airborne:
                 self.fly()
             else:
@@ -955,7 +1058,21 @@ class Pet:
         self.root.after(TICK_MS, self.tick)
 
 
+def already_running():
+    """True if another desktop pet is running. Holds a named mutex for as long as this program lives."""
+    global _mutex
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = wt.HANDLE
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
+    _mutex = kernel32.CreateMutexW(None, False, r"Local\DesktopPetSingleInstance")
+    return kernel32.GetLastError() == 183                  # ERROR_ALREADY_EXISTS
+
+
+_mutex = None
+
 if __name__ == "__main__":
+    if already_running():                                  # starting it twice does nothing
+        raise SystemExit
     enable_real_pixels()
     root = tk.Tk()
     Pet(root)
