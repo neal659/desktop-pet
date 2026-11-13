@@ -263,6 +263,8 @@ def foreground_is_fullscreen(mons):
     user32.GetClassNameW(hwnd, name, 64)
     if name.value in SKIP_CLASSES:                        # the desktop itself fills the screen
         return False
+    if name.value == "Chrome_WidgetWin_1":                # Chrome / Claude app: full screen still counts as a window
+        return False
     left, top, right, bottom = window_rect(hwnd)
     for m in mons:
         sl, st, sr, sb = m["screen"]
