@@ -5,7 +5,7 @@ top edges of other windows, hangs from the top edge of maximised windows, rides
 along when you move a window, and falls off when the window goes away.
 Drag it with the left mouse button and let go to drop (or throw) it.
 Right-click the creature: it goes away and comes back after 15 seconds.
-Middle-click the creature to close the program for good.
+Ctrl + right-click (or middle-click) the creature to close the program for good.
 Uses only the Python standard library (tkinter + ctypes).
 """
 import ctypes
@@ -52,6 +52,16 @@ HANG_TICKS = (150, 600)             # how long it hangs before letting go (about
 GRAB_REACH = 25                     # dropped this close below a top edge: it grabs it
 EDGE_TURN_CHANCE = 0.7              # at the end of a window top: turn around (otherwise walk off)
 RESPAWN_MS = 15000                  # right-click: gone for this long, then it drops in from the top again
+WALL_SLIDE = 1.0                    # sliding down a wall, pixels per tick
+WALL_CLIMB = 1.2                    # climbing up a wall, pixels per tick
+WALL_REACH = GRAB_REACH             # dropped this close to a wall: it grabs it
+WALL_GRAB_CHANCE = 0.4              # chance to catch a wall it passes (walking into it or falling past it)
+CLIMB_SHARE = 0.4                   # when it would leap: this share of the time it climbs a window side instead
+MIN_WALL = 40                       # ignore bits of wall shorter than this
+FAV_CLASS = "TkTopLevel"            # untitled Tk windows of other programs (the usage window): its favourite place
+FAV_STAY = 0.85                     # when it is not on the favourite window: chance to head there after a rest
+FAV_HOP = 0.5                       # when it is on it: chance to hop to another spot on it after a rest
+FAV_TURN_CHANCE = 0.97              # at the end of its favourite window: turn around (rather than walk off)
 MIN_LEDGE = 30                      # ignore visible bits of window tops narrower than this
 
 # --- Windows API -----------------------------------------------------------
@@ -152,7 +162,10 @@ def is_real_window(hwnd):
     """True for normal app windows you can see; False for hidden, minimised, tool and system windows."""
     if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
         return False
-    if user32.GetWindowTextLengthW(hwnd) == 0:            # no title: usually not a real app window
+    name = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, name, 64)
+    # no title: usually not a real app window (but small Tk tools such as the usage window have none)
+    if user32.GetWindowTextLengthW(hwnd) == 0 and name.value != "TkTopLevel":
         return False
     if user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
         return False
@@ -160,8 +173,6 @@ def is_real_window(hwnd):
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     if pid.value == OWN_PID:                              # our own window
         return False
-    name = ctypes.create_unicode_buffer(64)
-    user32.GetClassNameW(hwnd, name, 64)
     if name.value in SKIP_CLASSES:
         return False
     cloaked = wt.DWORD()
@@ -169,13 +180,21 @@ def is_real_window(hwnd):
     return cloaked.value == 0
 
 
+FAVOURITES = set()                  # handles of the favourite windows seen by the last windows_front_to_back()
+
+
 def windows_front_to_back():
     """All real windows as (hwnd, left, top, right, bottom). EnumWindows lists the front window first."""
     found = []
+    FAVOURITES.clear()
 
     def visit(hwnd, _):
         if is_real_window(hwnd):
             found.append((hwnd,) + window_rect(hwnd))
+            name = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, name, 64)
+            if name.value == FAV_CLASS:
+                FAVOURITES.add(hwnd)
         return True
 
     user32.EnumWindows(ENUM_PROC(visit), 0)
@@ -212,7 +231,8 @@ def find_spots(wins, mons, pet_height):
 
     ledges:   things to stand on: the bottom of every screen (key ("floor", i)) and window
               top edges with room above them (key = window handle).
-    ceilings: top edges of windows with no room above (maximised or full screen): it hangs below them.
+    ceilings: top edges of windows with no room above (maximised or full screen) and bottom edges of
+              windows with room below them (key (hwnd, "B")): it hangs below them.
     A window's top edge only counts where no window in front of it covers that edge.
     """
     ledges = [(("floor", i), m["work"][3], [(m["work"][0], m["work"][2])]) for i, m in enumerate(mons)]
@@ -232,7 +252,61 @@ def find_spots(wins, mons, pet_height):
             parts = [s for s in intersect(segments, ranges) if s[1] - s[0] >= MIN_LEDGE]
             if parts:
                 target.append((hwnd, top, parts))
+        # the bottom edge of a window that floats above the taskbar: stand on it (inside the window)
+        floats = [(m["work"][0], m["work"][2]) for m in mons
+                  if m["work"][1] + pet_height <= bottom < m["work"][3] - 3]
+        segments = [(left, right)]
+        for _, fl, ft, fr, fb in wins[:i]:
+            if ft <= bottom < fb:
+                segments = subtract(segments, fl, fr)
+        parts = [s for s in intersect(segments, floats) if s[1] - s[0] >= MIN_LEDGE]
+        if parts:
+            ledges.append(((hwnd, "B"), bottom, parts))
+        # ... or hang from it, below the window, if there is room under it
+        under = [(m["work"][0], m["work"][2]) for m in mons
+                 if m["work"][1] <= bottom and bottom + pet_height <= m["work"][3]]
+        parts = [s for s in intersect(segments, under) if s[1] - s[0] >= MIN_LEDGE]
+        if parts:
+            ceilings.append(((hwnd, "B"), bottom, parts))
     return ledges, ceilings
+
+
+def find_walls(wins, mons):
+    """Vertical edges it can hang on and slide down: a list of (key, x, [(top, bottom), ...], sides).
+
+    sides says on which side of the edge the creature's body may hang: +1 = to the right of the edge,
+    -1 = to the left. Outer screen edges only count from the inside; window sides from both sides.
+    A window side only counts where no window in front covers it. Key: ("screen", i, "L"/"R") or (hwnd, "L"/"R").
+    """
+    walls = []
+    for i, m in enumerate(mons):
+        left, _, right, _ = m["screen"]
+        for x, side, tag in ((left, 1, "L"), (right, -1, "R")):
+            segs = [(m["work"][1], m["work"][3])]
+            for o in mons:                                # another screen next to this edge hides it
+                if o is not m and (o["screen"][2] == x if side > 0 else o["screen"][0] == x):
+                    segs = subtract(segs, o["screen"][1], o["screen"][3])
+            segs = [g for g in segs if g[1] - g[0] >= MIN_WALL]
+            if segs:
+                walls.append((("screen", i, tag), x, segs, (side,)))
+    edges = [m["screen"][0] for m in mons] + [m["screen"][2] for m in mons]
+    for i, (hwnd, left, top, right, bottom) in enumerate(wins):
+        for x, tag in ((left, "L"), (right, "R")):
+            if any(abs(x - e) <= 8 for e in edges):       # maximised and snapped windows: the screen edge does it
+                continue
+            segs = []
+            for m in mons:
+                if m["screen"][0] <= x < m["screen"][2]:
+                    lo, hi = max(top, m["work"][1]), min(bottom, m["work"][3])
+                    if hi > lo:
+                        segs.append((lo, hi))
+            for _, fl, ft, fr, fb in wins[:i]:
+                if fl <= x < fr:
+                    segs = subtract(segs, ft, fb)
+            segs = [g for g in segs if g[1] - g[0] >= MIN_WALL]
+            if segs:
+                walls.append(((hwnd, tag), x, segs, (-1, 1)))
+    return walls
 
 
 def launch_speed(height):
@@ -242,6 +316,13 @@ def launch_speed(height):
     (a bit less than the smooth-motion formula). Solving that for v gives this.
     """
     return -(GRAVITY + math.sqrt(GRAVITY * GRAVITY + 8 * GRAVITY * height)) / 2
+
+
+def window_of(key):
+    """The window handle a spot key belongs to: hwnd, (hwnd, "B"/"L"/"R"), or None for floors and screens."""
+    if isinstance(key, tuple):
+        return key[0] if len(key) == 2 and not isinstance(key[0], str) else None
+    return key
 
 
 def find_at(spots, key, x):
@@ -283,6 +364,16 @@ class Pet:
         self.vx = self.vy = 0.0
         self.airborne = False
         self.hanging = False                        # holding on below a top edge
+        self.walls = []
+        self.wall = 0                               # clinging to a wall: side of the body (+1 right of it, -1 left)
+        self.wall_key = None
+        self.wall_mode = "hold"                     # hold / slide / climb
+        self.wall_left = 0                          # ticks left before letting go
+        self.wall_mode_left = 0
+        self.wall_cool = 0                          # ticks before it may catch another wall while walking
+        self.goal_wall = None                       # a wall it is walking to on purpose, to climb it
+        self.climb_to_top = False                   # climbing on purpose: keeps going up to the top
+        self.can_grab = True                        # may catch a wall while flying
         self.held = False                           # being dragged with the mouse
         self.on_key = ("floor", 0)                  # what it stands on or hangs from
         self.on_left = None                         # that window's left edge last tick (to ride along)
@@ -321,8 +412,8 @@ class Pet:
         self.w, self.h = GRID_W * self.px, GRID_H * self.px
         self.canvas.config(width=self.w, height=self.h)
         self.x = cx - self.w / 2
-        if self.hanging:
-            self.feet += self.h - old_h                   # keep the hands at the edge
+        if self.hanging or self.wall:
+            self.feet += self.h - old_h                   # keep the hands where they are
         self.redraw = True
 
     def lowest_floor_at(self, x):
@@ -354,30 +445,196 @@ class Pet:
         return None
 
     # --- Changing state -------------------------------------------------------
-    def start_falling(self, vx=0.0, vy=0.0):
-        self.airborne, self.hanging = True, False
+    def start_falling(self, vx=0.0, vy=0.0, grab=WALL_GRAB_CHANCE):
+        self.airborne, self.hanging, self.wall = True, False, 0
+        self.can_grab = random.random() < grab
         self.on_key = None
         self.vx, self.vy = vx, vy
 
     def attach(self, key):
         """Remember where the window it is now on sits, so it can ride along when it moves."""
         self.on_key = key
-        self.on_left = next((w[1] for w in self.wins if w[0] == key), None)
+        self.on_left = next((w[1] for w in self.wins if w[0] == window_of(key)), None)
         self.vx = self.vy = 0.0
         self.walk_left = 0
 
     def land(self, y, key):
-        self.airborne, self.hanging = False, False
+        self.airborne, self.hanging, self.wall = False, False, 0
         self.feet = float(y)
         self.attach(key)
         self.rest_left = random.randint(20, 60)        # catch its breath after landing
 
     def grab(self, y, key):
-        self.airborne, self.hanging = False, True
+        self.airborne, self.hanging, self.wall = False, True, 0
         self.feet = float(y + self.h)                   # hands at the edge, body below it
         self.attach(key)
         self.rest_left = random.randint(10, 40)
         self.hang_left = random.randint(*HANG_TICKS)
+
+    # --- Favourite window ---------------------------------------------------------
+    def favourite(self):
+        """The handle of the favourite window if one is open, else None."""
+        return next((w[0] for w in self.wins if w[0] in FAVOURITES), None)
+
+    def stay_near(self, fav):
+        """After a rest: stay on or around the favourite window. Returns True if it did something."""
+        on_it = window_of(self.on_key) == fav
+        if on_it:
+            if random.random() < FAV_HOP:
+                if random.random() < CLIMB_SHARE and self.plan_climb(fav):
+                    return True
+                return self.leap(fav)
+            return False
+        if random.random() >= FAV_STAY:
+            return False
+        if self.leap(fav):                                    # in reach: jump straight to it
+            return True
+        win = next(w for w in self.wins if w[0] == fav)       # too far: walk towards it
+        self.facing = 1 if (win[1] + win[3]) / 2 > self.centre() else -1
+        self.walk_left = 400
+        return True
+
+    # --- Walls ------------------------------------------------------------------
+    def hand_x(self, side, x=None):
+        """x of the hand that holds a wall, for a body on `side` of it (+1 right of the wall, -1 left)."""
+        x = self.x if x is None else x
+        return x + 1.5 * self.px if side > 0 else x + self.w - 1.5 * self.px
+
+    def wall_x(self, side, wall_x):
+        """Left edge of the sprite so that its hand is on the wall."""
+        return wall_x - 1.5 * self.px if side > 0 else wall_x - self.w + 1.5 * self.px
+
+    def wall_crossed(self, old_x, new_x, covering):
+        """A wall the hand passes when the sprite moves from old_x to new_x: (key, x, side) or None.
+
+        covering: the wall must reach from the head down to the feet (walking up to it);
+        otherwise the hands just have to be next to some part of it (flying past it).
+        """
+        if old_x == new_x:
+            return None
+        for key, wx, segs, sides in self.walls:
+            for s in sides:
+                if (self.hand_x(s, old_x) - wx) * s >= 0 >= (self.hand_x(s, new_x) - wx) * s:
+                    if covering:
+                        ok = any(a <= self.feet - self.h + 6 and b >= self.feet - 6 for a, b in segs)
+                    else:
+                        y = self.feet - self.h + self.px
+                        ok = any(a - 4 <= y <= b for a, b in segs)
+                    if ok:
+                        return key, wx, s
+        return None
+
+    def near_wall(self):
+        """The wall closest to the hands when dropped: (key, x, side) or None."""
+        y = self.feet - self.h
+        best = None
+        for key, wx, segs, sides in self.walls:
+            if not any(a - 6 <= y <= b for a, b in segs):
+                continue
+            s = 1 if self.centre() > wx else -1
+            if s not in sides:
+                continue
+            d = abs(self.hand_x(s) - wx)
+            if d <= WALL_REACH and (best is None or d < best[0]):
+                best = (d, key, wx, s)
+        return best and best[1:]
+
+    def set_wall_mode(self, mode=None):
+        if self.climb_to_top:
+            mode = "climb"
+        self.wall_mode = mode or random.choices(("hold", "slide", "climb"), (25, 40, 35))[0]
+        self.wall_mode_left = random.randint(60, 200)
+
+    def grab_wall(self, key, wx, side, mode=None):
+        self.airborne, self.hanging = False, False
+        self.wall, self.wall_key = side, key
+        self.x = self.wall_x(side, wx)
+        self.attach(key)
+        self.wall_left = random.randint(*HANG_TICKS)
+        self.climb_to_top = key == self.goal_wall         # it came here to climb: no giving up half way
+        self.set_wall_mode(mode)
+        self.goal_wall = None
+
+    def let_go_wall(self):
+        self.climb_to_top = False
+        self.start_falling(self.wall * 1.5, 0.0, grab=0)  # pushes away from the wall; no catching it again
+
+    def cling(self):
+        """One tick on a wall: hold on, slide down or climb up. Returns True while it moves."""
+        entry = next((w for w in self.walls if w[0] == self.wall_key), None)
+        if entry is None or self.wall not in entry[3]:        # the window moved away or closed
+            self.let_go_wall()
+            return False
+        _, wx, segs, _ = entry
+        y = self.feet - self.h
+        seg = next(((a, b) for a, b in segs if a - 6 <= y <= b), None)
+        if seg is None:
+            self.let_go_wall()
+            return False
+        self.x = self.wall_x(self.wall, wx)                   # follows the window when it moves
+        if not self.climb_to_top:
+            self.wall_left -= 1
+        if self.wall_left <= 0:
+            self.let_go_wall()
+            return False
+        self.wall_mode_left -= 1
+        if self.wall_mode_left <= 0:
+            self.set_wall_mode()
+        if self.wall_mode == "slide":
+            new_feet = self.feet + WALL_SLIDE
+            hit = self.landing_between(self.feet, new_feet)   # reached something to stand on
+            if hit:
+                self.land(*hit)
+                return False
+            self.feet = new_feet
+            if self.feet - self.h > seg[1]:                   # slid off the bottom of the wall
+                self.let_go_wall()
+            return True
+        if self.wall_mode == "climb":
+            self.feet -= WALL_CLIMB
+            if self.feet - self.h <= seg[0]:
+                self.top_of_wall(wx, seg)
+            return True
+        return False
+
+    def top_of_wall(self, wx, seg):
+        """Climbed to the top of a wall: pull up onto the window's top edge if it has one, else turn around."""
+        key = self.wall_key
+        self.climb_to_top = False
+        if not isinstance(key[0], str):                       # a window side (not a screen edge)
+            ledge = next((l for l in self.ledges if l[0] == key[0]), None)
+            if ledge and abs(ledge[1] - seg[0]) <= 3:
+                cx = wx + (14 if key[1] == "L" else -14)      # a little way in from the corner
+                if any(l <= cx <= r for l, r in ledge[2]):
+                    self.x = cx - self.w / 2
+                    self.land(ledge[1], key[0])
+                    return
+        self.set_wall_mode("slide")
+
+    def plan_climb(self, only_window=None):
+        """Walk to the side of a window on this level, to climb it instead of jumping. False if none."""
+        spot = find_at(self.ledges, self.on_key, self.centre())
+        if spot is None:
+            return False
+        _, (seg_l, seg_r) = spot
+        cx = self.centre()
+        options = []
+        for key, wx, segs, sides in self.walls:
+            if isinstance(key[0], str) or not any(l[0] == key[0] for l in self.ledges):
+                continue                                      # only windows that have a top to climb to
+            if only_window is not None and key[0] != only_window:
+                continue
+            if not seg_l <= wx <= seg_r or abs(wx - cx) > LEAP_REACH:
+                continue
+            if not any(a <= self.feet - self.h + 6 and b >= self.feet - 6 for a, b in segs):
+                continue                                      # the side must reach down to where it stands
+            options.append((key, -1 if wx > cx else 1))
+        if not options:
+            return False
+        self.goal_wall, side = random.choice(options)
+        self.facing = -side
+        self.walk_left = 400
+        return True
 
     # --- Movement -------------------------------------------------------------
     def fly(self):
@@ -385,7 +642,13 @@ class Pet:
         left = min(m["screen"][0] for m in self.mons)
         right = max(m["screen"][2] for m in self.mons)
         self.vy = min(self.vy + GRAVITY, MAX_FALL)
+        old_x = self.x
         self.x += self.vx
+        if self.can_grab and self.vx:                     # flying past a wall: it may catch hold
+            hit = self.wall_crossed(old_x, self.x, covering=False)
+            if hit:
+                self.grab_wall(*hit)
+                return
         if self.x < left or self.x + self.w > right:      # bounce off the outer screen edges
             self.x = max(left, min(self.x, right - self.w))
             self.vx = -self.vx * 0.5
@@ -408,13 +671,17 @@ class Pet:
         if self.vx:
             self.facing = 1 if self.vx > 0 else -1
 
-    def leap(self):
-        """Jump in an arc to a random window top or ceiling. Returns False if there is nothing in reach."""
+    def leap(self, only_window=None):
+        """Jump in an arc to a random window top or ceiling. Returns False if there is nothing in reach.
+
+        only_window: jump only to spots that belong to this window."""
         cx = self.centre()
         spots = []
         for kind, spots_list in (("stand", self.ledges), ("hang", self.ceilings)):
             for key, y, segments in spots_list:
                 if key == self.on_key or (kind == "hang" and y >= self.feet - self.h):
+                    continue
+                if only_window is not None and window_of(key) != only_window:
                     continue
                 for l, r in segments:
                     tx = random.uniform(l + 10, r - 10)
@@ -454,13 +721,32 @@ class Pet:
             self.walk_left -= 1
             step = WALK_SPEED * self.facing
             new_cx = self.centre() + step
+            if self.wall_cool > 0:
+                self.wall_cool -= 1
+            else:                                         # walking up to a wall: maybe climb it
+                hit = self.wall_crossed(self.x, self.x + step + self.facing * 1.5 * self.px, covering=True)   # looks one hand ahead
+                if hit and hit[2] == -self.facing:
+                    if hit[0] == self.goal_wall or random.random() < WALL_GRAB_CHANCE:
+                        self.grab_wall(*hit, mode="climb")
+                        return True
+                    self.wall_cool = 60
             if not self.fits(new_cx + self.facing * (self.w / 2 - 1), self.feet):
                 self.facing = -self.facing                # the body would go over the edge of the screens: turn
                 return True
             if not seg_l <= new_cx <= seg_r:              # reached the end
+                wkey = (self.on_key, "R" if self.facing > 0 else "L")
+                entry = next((w for w in self.walls if w[0] == wkey), None)
+                if entry and isinstance(self.on_key, int) and random.random() < WALL_GRAB_CHANCE:
+                    top = min(g[0] for g in entry[2])     # climb down: hang from the corner and slide
+                    if abs(top - y) <= 3:
+                        self.grab_wall(wkey, entry[1], self.facing, mode="slide")
+                        self.feet = top + self.h + 4
+                        return True
                 beyond = self.screen_at(new_cx, self.feet - 1)
-                on_floor = isinstance(self.on_key, tuple)
-                if beyond is None or (not on_floor and random.random() < EDGE_TURN_CHANCE):
+                on_floor = isinstance(self.on_key, tuple) and self.on_key[0] in ("floor", "screen")
+                on_fav = window_of(self.on_key) == self.favourite() and self.favourite() is not None
+                chance = FAV_TURN_CHANCE if on_fav else EDGE_TURN_CHANCE
+                if beyond is None or (not on_floor and random.random() < chance):
                     self.facing = -self.facing            # screen edge, or it decided to turn around
                     return True
                 self.x += step                            # walk off and fall (onto the next screen, too)
@@ -469,11 +755,18 @@ class Pet:
             self.x += step
             if self.walk_left == 0:
                 self.rest_left = random.randint(30, 150)
+                self.goal_wall = None
             return True
         self.rest_left -= 1
         if self.rest_left <= 0:
-            if random.random() < LEAP_CHANCE and self.leap():
+            fav = self.favourite()
+            if fav is not None and self.stay_near(fav):
                 return False
+            if fav is None and random.random() < LEAP_CHANCE:
+                if random.random() < CLIMB_SHARE and self.plan_climb():
+                    return False
+                if self.leap():
+                    return False
             self.walk_left = random.randint(80, 300)
             if random.random() < 0.4:
                 self.facing = -self.facing
@@ -513,14 +806,17 @@ class Pet:
     def ride(self):
         """If the window it is on moved sideways, move with it."""
         for hwnd, left, top, right, bottom in self.wins:
-            if hwnd == self.on_key:
+            if hwnd == window_of(self.on_key):
                 if self.on_left is not None:
                     self.x += left - self.on_left
                 self.on_left = left
                 return
 
     # --- Vanishing and respawning ---------------------------------------------
-    def vanish(self, _event=None):
+    def vanish(self, event=None):
+        if event is not None and event.state & 0x0004:    # Ctrl held: quit for good
+            self.root.destroy()
+            return
         self.gone = True
         self.held = False
         self.root.withdraw()
@@ -546,6 +842,7 @@ class Pet:
     def on_grab(self, e):
         self.held = True
         self.hanging = False
+        self.wall = 0
         self.grab_dx, self.grab_dy = e.x_root - self.x, e.y_root - self.feet
         self.last_mouse = (e.x_root, e.y_root)
         self.throw = (0.0, 0.0)
@@ -565,8 +862,12 @@ class Pet:
         if hit:
             self.grab(*hit)
             return
+        near = self.near_wall()                           # let go next to a wall: hold on to it
+        if near:
+            self.grab_wall(*near)
+            return
         vx, vy = (max(-25, min(25, v)) for v in self.throw)
-        self.start_falling(vx, vy)
+        self.start_falling(vx, vy, grab=1.0)
 
     # --- Drawing ------------------------------------------------------------
     def sprite_rows(self, moving):
@@ -579,7 +880,15 @@ class Pet:
             eyes = EYES_SHUT
         else:
             eyes = EYES_OPEN
-        if self.hanging:
+        if self.wall:                                    # on a wall: one hand up on it, legs dangling
+            if self.wall_mode == "climb" and moving and (f // 2) % 2 == 1:
+                top = EMPTY_ROW                          # reaching up: the top hand lets go for a moment
+            else:
+                top = HANDS_LEFT
+            legs = LEGS_DANGLE if f % 8 < 4 else LEGS_A
+            rows = [top, HANDS_LEFT, ARMS_UP, eyes[0], eyes[1], BODY_ROW, BODY_ROW, BODY_ROW,
+                    LEGS_DANGLE, legs]
+        elif self.hanging:
             if moving:                                   # hand over hand: one hand reaches forward at a time
                 hands = HANDS_LEFT if (f // 2) % 2 == 0 else HANDS_RIGHT
             else:
@@ -601,7 +910,7 @@ class Pet:
             for i, row in enumerate(body):
                 rows[top + i] = row
             rows[8], rows[9] = legs
-        if self.facing < 0:
+        if (self.wall < 0) if self.wall else (self.facing < 0):
             rows = [r[::-1] for r in rows]
         return rows
 
@@ -624,13 +933,19 @@ class Pet:
         self.wins = windows_front_to_back()
         self.update_scale()
         self.ledges, self.ceilings = find_spots(self.wins, self.mons, self.h)
+        self.walls = find_walls(self.wins, self.mons)
         moving = False
         if not self.held:
             if self.airborne:
                 self.fly()
             else:
                 self.ride()
-                moving = self.hang() if self.hanging else self.walk()
+                if self.wall:
+                    moving = self.cling()
+                elif self.hanging:
+                    moving = self.hang()
+                else:
+                    moving = self.walk()
         if self.ticks % TICKS_PER_FRAME == 0 or self.redraw:
             self.redraw = False
             self.frame += 1
