@@ -111,8 +111,18 @@ user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
 user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
 dwmapi.DwmGetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
 
+user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetParent.argtypes = [wt.HWND]
+user32.GetParent.restype = wt.HWND
+user32.SetWindowLongW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_long]
+user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.UINT]
+
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000       # clicking it never makes it the active window
+SW_HIDE, SW_SHOWNOACTIVATE = 0, 4   # show/hide without taking the focus
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_FRAMECHANGED = 0x1, 0x2, 0x4, 0x10, 0x20
 MONITORINFOF_PRIMARY = 1
 DWMWA_EXTENDED_FRAME_BOUNDS = 9     # the window's real visible edges (without the invisible resize border)
 DWMWA_CLOAKED = 14                  # "cloaked" = hidden by Windows (other virtual desktop, background apps)
@@ -216,6 +226,24 @@ def is_real_window(hwnd):
 
 
 FAVOURITES = set()                  # handles of the favourite windows seen by the last windows_front_to_back()
+
+
+def foreground_is_fullscreen(mons):
+    """True if the window in front covers a whole screen (full-screen video, game, F11 browser)."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd or not user32.IsWindowVisible(hwnd):
+        return False
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if pid.value == OWN_PID:
+        return False
+    name = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, name, 64)
+    if name.value in SKIP_CLASSES:                        # the desktop itself fills the screen
+        return False
+    left, top, right, bottom = window_rect(hwnd)
+    return any(left <= m["screen"][0] + 1 and top <= m["screen"][1] + 1
+               and right >= m["screen"][2] - 1 and bottom >= m["screen"][3] - 1 for m in mons)
 
 
 def windows_front_to_back():
@@ -380,12 +408,15 @@ class Pet:
         root.attributes("-transparentcolor", SEE_THROUGH)
         root.config(bg=SEE_THROUGH)
         self.gone = False                           # hidden, waiting to respawn
+        self.fs_hidden = False                      # hidden because a full-screen window is in front
         self.menu = None                            # the colour menu while it is open
         self.colour = random.choice(PALETTE)
         self.redraw = False                         # draw at once (after the size changed)
         self.canvas = tk.Canvas(root, width=self.w, height=self.h, bg=SEE_THROUGH,
                                 highlightthickness=0, bd=0)
         self.canvas.pack()
+        root.update_idletasks()
+        self.make_unobtrusive()
         self.canvas.bind("<Button-3>", self.vanish)                # right-click: gone for a while
         self.canvas.bind("<Button-2>", lambda e: root.destroy())   # middle-click: quit for good
         self.canvas.bind("<ButtonPress-1>", self.on_grab)
@@ -849,6 +880,22 @@ class Pet:
                 self.on_left = left
                 return
 
+    # --- Staying out of the way -------------------------------------------------
+    def native_window(self):
+        inner = self.root.winfo_id()
+        return user32.GetParent(inner) or inner
+
+    def make_unobtrusive(self):
+        """The creature's window never takes the focus, and is not a normal app window."""
+        hwnd = self.native_window()
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+        user32.SetWindowPos(hwnd, None, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+
+    def set_visible(self, visible):
+        user32.ShowWindow(self.native_window(), SW_SHOWNOACTIVATE if visible else SW_HIDE)
+
     # --- Vanishing and respawning ---------------------------------------------
     def vanish(self, event=None):
         if event is not None and event.state & 0x0004:    # Ctrl held: quit for good
@@ -859,7 +906,7 @@ class Pet:
             return
         self.gone = True
         self.held = False
-        self.root.withdraw()
+        self.set_visible(False)
         self.root.after(RESPAWN_MS, self.respawn)
 
     # --- Colour menu ----------------------------------------------------------
@@ -938,8 +985,8 @@ class Pet:
         self.rest_left = 30
         self.redraw = True
         self.gone = False
-        self.root.deiconify()
-        self.root.attributes("-topmost", True)
+        self.fs_hidden = foreground_is_fullscreen(self.mons)
+        self.set_visible(not self.fs_hidden)
 
     # --- Mouse ------------------------------------------------------------
     def on_grab(self, e):
@@ -1031,6 +1078,13 @@ class Pet:
     def tick(self):
         if self.gone:                                     # hidden: just wait
             self.root.after(TICK_MS, self.tick)
+            return
+        fullscreen = foreground_is_fullscreen(self.mons)  # a full-screen app is in front: get out of its way
+        if fullscreen != self.fs_hidden:
+            self.fs_hidden = fullscreen
+            self.set_visible(not fullscreen)
+        if fullscreen:
+            self.root.after(TICK_MS * 5, self.tick)
             return
         self.mons = monitors()                            # screens and taskbars can change
         self.wins = windows_front_to_back()
