@@ -124,6 +124,7 @@ WS_EX_TOPMOST = 0x00000008
 WS_EX_NOACTIVATE = 0x08000000       # clicking it never makes it the active window
 SW_HIDE, SW_SHOWNOACTIVATE = 0, 4   # show/hide without taking the focus
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_FRAMECHANGED = 0x1, 0x2, 0x4, 0x10, 0x20
+HWND_TOPMOST = -1
 MONITORINFOF_PRIMARY = 1
 DWMWA_EXTENDED_FRAME_BOUNDS = 9     # the window's real visible edges (without the invisible resize border)
 DWMWA_CLOAKED = 14                  # "cloaked" = hidden by Windows (other virtual desktop, background apps)
@@ -920,6 +921,11 @@ class Pet:
         user32.SetWindowPos(hwnd, None, 0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
 
+    def raise_to_top(self):
+        """Other topmost windows (the usage window) jump above us when clicked: step back in front, no focus."""
+        user32.SetWindowPos(self.native_window(), HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
     def set_visible(self, visible):
         user32.ShowWindow(self.native_window(), SW_SHOWNOACTIVATE if visible else SW_HIDE)
 
@@ -1135,6 +1141,8 @@ class Pet:
             self.frame += 1
             self.draw(self.sprite_rows(moving))
         self.root.geometry(f"{self.w}x{self.h}+{round(self.x)}+{round(self.feet) - self.h}")
+        if self.ticks % 10 == 0:
+            self.raise_to_top()
         self.ticks += 1
         self.root.after(TICK_MS, self.tick)
 
