@@ -120,6 +120,7 @@ user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ct
 
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_TOPMOST = 0x00000008
 WS_EX_NOACTIVATE = 0x08000000       # clicking it never makes it the active window
 SW_HIDE, SW_SHOWNOACTIVATE = 0, 4   # show/hide without taking the focus
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_FRAMECHANGED = 0x1, 0x2, 0x4, 0x10, 0x20
@@ -228,8 +229,29 @@ def is_real_window(hwnd):
 FAVOURITES = set()                  # handles of the favourite windows seen by the last windows_front_to_back()
 
 
+def taskbar_on_top(screen):
+    """True if a taskbar is showing above other windows on this screen (it is the creature's floor)."""
+    found = []
+
+    def visit(hwnd, _):
+        name = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, name, 64)
+        if name.value in ("Shell_TrayWnd", "Shell_SecondaryTrayWnd") and user32.IsWindowVisible(hwnd):
+            r = wt.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            cx, cy = (r.left + r.right) // 2, (r.top + r.bottom) // 2
+            if screen[0] <= cx < screen[2] and screen[1] <= cy < screen[3]                     and user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST:
+                found.append(hwnd)
+        return True
+
+    user32.EnumWindows(ENUM_PROC(visit), 0)
+    return bool(found)
+
+
 def foreground_is_fullscreen(mons):
-    """True if the window in front covers a whole screen (full-screen video, game, F11 browser)."""
+    """True if the window in front really is full screen (video, game, F11 browser) and hides the taskbar.
+
+    Windows sometimes leaves the taskbar showing over a full-screen window; then the creature stays."""
     hwnd = user32.GetForegroundWindow()
     if not hwnd or not user32.IsWindowVisible(hwnd):
         return False
@@ -242,8 +264,11 @@ def foreground_is_fullscreen(mons):
     if name.value in SKIP_CLASSES:                        # the desktop itself fills the screen
         return False
     left, top, right, bottom = window_rect(hwnd)
-    return any(left <= m["screen"][0] + 1 and top <= m["screen"][1] + 1
-               and right >= m["screen"][2] - 1 and bottom >= m["screen"][3] - 1 for m in mons)
+    for m in mons:
+        sl, st, sr, sb = m["screen"]
+        if left <= sl + 1 and top <= st + 1 and right >= sr - 1 and bottom >= sb - 1:
+            return not taskbar_on_top(m["screen"])
+    return False
 
 
 def windows_front_to_back():
